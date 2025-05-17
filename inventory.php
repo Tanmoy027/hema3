@@ -1,38 +1,192 @@
 <?php
-require 'db.php'; // This should initialize $conn from db.php
+require 'db.php'; // This file initializes $pdo and starts the session
 if (empty($_SESSION['uid'])) {
     header('Location: login.php');
     exit;
 }
 
-// Check if $conn is properly initialized
-if (!isset($conn) || $conn === null) {
-    // Create a fallback connection if not set by db.php
-    try {
-        $host = 'localhost';
-        $dbname = 'warehouse_db';
-        $user = 'root';
-        $pass = '';
-        $conn = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8mb4", $user, $pass);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    } catch(PDOException $e) {
-        die("Connection failed: " . $e->getMessage());
+// Use $pdo from db.php for all database operations
+$conn = $pdo;
+
+// Process AJAX requests
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json');
+    $response = ['success' => false, 'message' => 'Invalid action'];
+    
+    // Add new product
+    if (isset($_POST['action']) && $_POST['action'] === 'add_product') {
+        try {
+            $conn->beginTransaction();
+            
+            // Insert into products table
+            $stmt = $conn->prepare("INSERT INTO products (sku, name, description, unit_price, reorder_level, supplier_id) 
+                                   VALUES (?, ?, ?, ?, ?, ?)");
+            $stmt->execute([
+                $_POST['sku'],
+                $_POST['name'],
+                $_POST['description'],
+                $_POST['unitPrice'],
+                $_POST['reorderLevel'],
+                !empty($_POST['supplier']) ? $_POST['supplier'] : null
+            ]);
+            
+            $productId = $conn->lastInsertId();
+            
+            // Insert initial stock if provided
+            if (!empty($_POST['initialStock']) && $_POST['initialStock'] > 0) {
+                $stmt = $conn->prepare("INSERT INTO stock_movements (product_id, movement_type, qty, reference, moved_by) 
+                                       VALUES (?, 'PURCHASE', ?, 'Initial stock', ?)");
+                $stmt->execute([
+                    $productId,
+                    $_POST['initialStock'],
+                    $_SESSION['uid'] ?? 1
+                ]);
+            }
+            
+            $conn->commit();
+            $response = ['success' => true, 'message' => 'Product added successfully'];
+        } catch (PDOException $e) {
+            $conn->rollBack();
+            $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+        }
+        echo json_encode($response);
+        exit;
     }
+    
+    // Update existing product
+    if (isset($_POST['action']) && $_POST['action'] === 'edit_product') {
+        try {
+            $stmt = $conn->prepare("UPDATE products SET sku = ?, name = ?, description = ?, 
+                                  unit_price = ?, reorder_level = ?, supplier_id = ? 
+                                  WHERE id = ?");
+            $stmt->execute([
+                $_POST['sku'],
+                $_POST['name'],
+                $_POST['description'],
+                $_POST['unitPrice'],
+                $_POST['reorderLevel'],
+                !empty($_POST['supplier']) ? $_POST['supplier'] : null,
+                $_POST['productId']
+            ]);
+            
+            $response = ['success' => true, 'message' => 'Product updated successfully'];
+        } catch (PDOException $e) {
+            $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+        }
+        echo json_encode($response);
+        exit;
+    }
+    
+    // Delete product
+    if (isset($_POST['action']) && $_POST['action'] === 'delete_product') {
+        try {
+            $stmt = $conn->prepare("DELETE FROM products WHERE id = ?");
+            $stmt->execute([$_POST['productId']]);
+            $response = ['success' => true, 'message' => 'Product deleted successfully'];
+        } catch (PDOException $e) {
+            $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+        }
+        echo json_encode($response);
+        exit;
+    }
+    
+    // Adjust stock
+    if (isset($_POST['action']) && $_POST['action'] === 'adjust_stock') {
+        try {
+            $conn->beginTransaction();
+            
+            // Get current stock
+            $stmt = $conn->prepare("SELECT SUM(CASE WHEN movement_type IN ('PURCHASE') THEN qty 
+                                       WHEN movement_type IN ('SALE', 'ADJUST') THEN -qty 
+                                       ELSE 0 END) as current_stock 
+                                FROM stock_movements 
+                                WHERE product_id = ?");
+            $stmt->execute([$_POST['productId']]);
+            $currentStock = $stmt->fetch(PDO::FETCH_ASSOC)['current_stock'] ?? 0;
+            
+            // Determine movement type and sign
+            $movementType = $_POST['movementType'];
+            $quantity = abs(intval($_POST['quantity']));
+            
+            // Insert stock movement
+            $stmt = $conn->prepare("INSERT INTO stock_movements (product_id, movement_type, qty, reference, moved_by) 
+                                   VALUES (?, ?, ?, ?, ?)");
+            $stmt->execute([
+                $_POST['productId'],
+                $movementType,
+                $quantity,
+                $_POST['reference'] ?? '',
+                $_SESSION['uid'] ?? 1
+            ]);
+            
+            $conn->commit();
+            $response = ['success' => true, 'message' => 'Stock adjusted successfully'];
+        } catch (PDOException $e) {
+            $conn->rollBack();
+            $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+        }
+        echo json_encode($response);
+        exit;
+    }
+    
+    // Get product details (for edit modal)
+    if (isset($_POST['action']) && $_POST['action'] === 'get_product') {
+        try {
+            $stmt = $conn->prepare("SELECT * FROM products WHERE id = ?");
+            $stmt->execute([$_POST['productId']]);
+            $product = $stmt->fetch(PDO::FETCH_ASSOC);
+            
+            if ($product) {
+                $response = ['success' => true, 'product' => $product];
+            } else {
+                $response = ['success' => false, 'message' => 'Product not found'];
+            }
+        } catch (PDOException $e) {
+            $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+        }
+        echo json_encode($response);
+        exit;
+    }
+    
+    echo json_encode($response);
+    exit;
 }
 
-// Get inventory data
+// Get query params for filtering
+$supplierFilter = isset($_GET['supplier']) ? intval($_GET['supplier']) : null;
+
+// Get inventory data with view
 try {
-    $stmt = $conn->query("SELECT p.id, p.sku, p.name, p.description, p.unit_price, COALESCE(v.on_hand, 0) as stock, 
-                     p.reorder_level, s.name as supplier 
-                     FROM products p 
-                     LEFT JOIN v_product_stock v ON p.id = v.id
-                     LEFT JOIN suppliers s ON p.supplier_id = s.id
-                     ORDER BY p.name");
+    $queryParams = [];
+    $supplierWhere = "";
+    
+    if ($supplierFilter) {
+        $supplierWhere = " WHERE p.supplier_id = ?";
+        $queryParams[] = $supplierFilter;
+    }
+    
+    // Using the existing view v_product_stock
+    $stmt = $conn->prepare("SELECT p.id, p.sku, p.name, p.description, p.unit_price, 
+                  COALESCE(vs.on_hand, 0) as stock,
+                  p.reorder_level, s.name as supplier, s.id as supplier_id
+                  FROM products p 
+                  LEFT JOIN v_product_stock vs ON p.id = vs.id
+                  LEFT JOIN suppliers s ON p.supplier_id = s.id" . $supplierWhere . "
+                  ORDER BY p.name");
+    
+    $stmt->execute($queryParams);
     $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
 } catch(PDOException $e) {
     $products = [];
-    // Optionally show an error message
     $errorMsg = "Database error: " . $e->getMessage();
+}
+
+// Get supplier list
+try {
+    $stmt = $conn->query("SELECT id, name FROM suppliers ORDER BY name");
+    $suppliers = $stmt->fetchAll(PDO::FETCH_ASSOC);
+} catch(PDOException $e) {
+    $suppliers = [];
 }
 ?>
 <!DOCTYPE html>
@@ -80,7 +234,7 @@ try {
     <header>
         <div class="container">
             <h1 class="display-5 fw-bold mb-3">INVENTORY CONTROL</h1>
-            <p class="lead mb-0">Storage Facility #<?= rand(100, 999) ?> | Total SKUs: <?= count($products) ?></p>
+            <p class="lead mb-0">Storage Facility #101 | Total SKUs: <?= count($products) ?> | User: <?= htmlspecialchars($_SESSION['username'] ?? 'Tanmoy027') ?></p>
         </div>
     </header>
 
@@ -104,6 +258,11 @@ try {
                             </div>
                         </div>
                         <div class="col-md-6 text-md-end">
+                            <?php if ($supplierFilter): ?>
+                                <a href="inventory.php" class="btn btn-warning me-2">
+                                    <i class="bi bi-funnel me-1"></i> CLEAR FILTER
+                                </a>
+                            <?php endif; ?>
                             <button class="btn btn-primary me-2" data-bs-toggle="modal" data-bs-target="#addProductModal">
                                 <i class="bi bi-plus-lg me-1"></i> NEW ITEM
                             </button>
@@ -111,10 +270,10 @@ try {
                                 <button class="btn btn-outline-light" title="Scan Barcode">
                                     <i class="bi bi-upc-scan"></i>
                                 </button>
-                                <button class="btn btn-outline-light" title="Export Data">
+                                <button class="btn btn-outline-light" title="Export Data" id="exportBtn">
                                     <i class="bi bi-file-earmark-arrow-down"></i>
                                 </button>
-                                <button class="btn btn-outline-light" title="Print">
+                                <button class="btn btn-outline-light" title="Print" onclick="window.print()">
                                     <i class="bi bi-printer"></i>
                                 </button>
                             </div>
@@ -198,7 +357,7 @@ try {
                 <tbody id="productTableBody">
                     <?php if (count($products) > 0): ?>
                         <?php foreach ($products as $product): ?>
-                            <tr>
+                            <tr data-product-id="<?= $product['id'] ?>">
                                 <td class="fw-bold"><?= htmlspecialchars($product['sku']) ?></td>
                                 <td><?= htmlspecialchars($product['name']) ?></td>
                                 <td class="text-muted"><?= htmlspecialchars($product['description'] ?? '-') ?></td>
@@ -216,7 +375,15 @@ try {
                                     </span>
                                 </td>
                                 <td class="text-end">$<?= number_format($product['unit_price'], 2) ?></td>
-                                <td><?= htmlspecialchars($product['supplier'] ?? '-') ?></td>
+                                <td>
+                                    <?php if($product['supplier']): ?>
+                                        <a href="inventory.php?supplier=<?= $product['supplier_id'] ?>" class="text-decoration-none">
+                                            <?= htmlspecialchars($product['supplier']) ?>
+                                        </a>
+                                    <?php else: ?>
+                                        -
+                                    <?php endif; ?>
+                                </td>
                                 <td class="text-center">
                                     <div class="btn-group btn-group-sm">
                                         <button class="btn btn-outline-light" title="Adjust Stock" onclick="adjustStock(<?= $product['id'] ?>)">
@@ -239,9 +406,6 @@ try {
                                     <i class="bi bi-inbox text-muted" style="font-size: 2.5rem;"></i>
                                     <h5 class="mt-2 mb-1">No products found</h5>
                                     <p class="text-muted small">Add your first product to get started</p>
-                                    <button class="btn btn-primary btn-sm mt-2" data-bs-toggle="modal" data-bs-target="#addProductModal">
-                                        <i class="bi bi-plus-circle me-1"></i> Add Product
-                                    </button>
                                 </div>
                             </td>
                         </tr>
@@ -261,6 +425,7 @@ try {
                 </div>
                 <div class="modal-body">
                     <form id="addProductForm">
+                        <input type="hidden" id="productId" name="productId">
                         <div class="row mb-3">
                             <div class="col-md-6">
                                 <label for="sku" class="form-label">SKU*</label>
@@ -297,36 +462,9 @@ try {
                                 <label for="supplier" class="form-label">Supplier</label>
                                 <select class="form-select search-box" id="supplier" name="supplier">
                                     <option value="" selected>-- Select Supplier --</option>
-                                    <?php 
-                                    try {
-                                        $suppliers = $conn->query("SELECT id, name FROM suppliers ORDER BY name");
-                                        while ($supplier = $suppliers->fetch(PDO::FETCH_ASSOC)) {
-                                            echo '<option value="' . $supplier['id'] . '">' . htmlspecialchars($supplier['name']) . '</option>';
-                                        }
-                                    } catch(PDOException $e) {
-                                        // Just don't show suppliers if query fails
-                                    }
-                                    ?>
-                                </select>
-                            </div>
-                            <div class="col-md-6">
-                                <label for="location" class="form-label">Location</label>
-                                <select class="form-select search-box" id="location" name="location">
-                                    <option value="" selected>-- Select Location --</option>
-                                    <?php 
-                                    try {
-                                        $locations = $conn->query("SELECT id, code, description FROM locations ORDER BY code");
-                                        while ($location = $locations->fetch(PDO::FETCH_ASSOC)) {
-                                            $locationText = $location['code'];
-                                            if (!empty($location['description'])) {
-                                                $locationText .= " - " . $location['description'];
-                                            }
-                                            echo '<option value="' . $location['id'] . '">' . htmlspecialchars($locationText) . '</option>';
-                                        }
-                                    } catch(PDOException $e) {
-                                        // Just don't show locations if query fails
-                                    }
-                                    ?>
+                                    <?php foreach ($suppliers as $supplier): ?>
+                                        <option value="<?= $supplier['id'] ?>"><?= htmlspecialchars($supplier['name']) ?></option>
+                                    <?php endforeach; ?>
                                 </select>
                             </div>
                         </div>
@@ -364,8 +502,7 @@ try {
                             <select class="form-select search-box" id="movementType" name="movementType" required>
                                 <option value="PURCHASE">Stock In (Purchase)</option>
                                 <option value="SALE">Stock Out (Sale)</option>
-                                <option value="ADJUST">Adjustment</option>
-                                <option value="TRANSFER">Transfer</option>
+                                <option value="ADJUST">Stock Adjustment</option>
                             </select>
                         </div>
                         <div class="mb-3">
@@ -387,7 +524,7 @@ try {
     </div>
 
     <footer class="mt-auto text-center py-3 small text-white-50" style="background:var(--dark)">
-        © <?=date('Y')?> Warehouse Management System
+        © <?=date('Y')?> Warehouse Management System | Updated: 2025-05-17 01:03:41
     </footer>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -420,63 +557,206 @@ try {
 
         // Product functions
         function adjustStock(productId) {
-            // We would fetch the current product details here via AJAX
-            // For now, let's simulate it with the data we already have
-            const productRow = document.querySelector(`tr[data-product-id="${productId}"]`) || 
-                               document.querySelector(`button[onclick="adjustStock(${productId})"]`).closest('tr');
+            // Get the product details
+            const productRow = document.querySelector(`tr[data-product-id="${productId}"]`);
+            if (!productRow) return;
             
-            if (productRow) {
-                const name = productRow.cells[1].textContent.trim();
-                const stock = productRow.cells[3].textContent.trim();
-                
-                document.getElementById('adjustProductId').value = productId;
-                document.getElementById('productNameDisplay').textContent = name;
-                document.getElementById('currentStockDisplay').textContent = stock;
-                
-                const adjustStockModal = new bootstrap.Modal(document.getElementById('adjustStockModal'));
-                adjustStockModal.show();
-            } else {
-                // Fallback if row not found
-                const adjustStockModal = new bootstrap.Modal(document.getElementById('adjustStockModal'));
-                document.getElementById('adjustProductId').value = productId;
-                document.getElementById('productNameDisplay').textContent = "Product #" + productId;
-                document.getElementById('currentStockDisplay').textContent = "Unknown";
-                adjustStockModal.show();
-            }
+            // Get product name and current stock from the row
+            const productName = productRow.cells[1].textContent;
+            const currentStock = productRow.querySelector('.badge').textContent.trim();
+            
+            // Set values in the form
+            document.getElementById('adjustProductId').value = productId;
+            document.getElementById('productNameDisplay').textContent = productName;
+            document.getElementById('currentStockDisplay').textContent = currentStock;
+            document.getElementById('quantity').value = '1';
+            document.getElementById('reference').value = '';
+            
+            // Show the modal
+            const adjustStockModal = new bootstrap.Modal(document.getElementById('adjustStockModal'));
+            adjustStockModal.show();
         }
         
         function editProduct(productId) {
-            // Implementation would populate and show the edit modal
-            alert('Edit product ID: ' + productId);
+            // Reset form
+            document.getElementById('addProductForm').reset();
+            document.getElementById('productId').value = productId;
+            
+            // Change modal title
+            document.querySelector('#addProductModal .modal-title').textContent = 'Edit Product';
+            
+            // Fetch product data via AJAX
+            const formData = new FormData();
+            formData.append('action', 'get_product');
+            formData.append('productId', productId);
+            
+            fetch('inventory.php', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    // Populate form fields
+                    const product = data.product;
+                    document.getElementById('sku').value = product.sku;
+                    document.getElementById('name').value = product.name;
+                    document.getElementById('description').value = product.description || '';
+                    document.getElementById('unitPrice').value = product.unit_price;
+                    document.getElementById('initialStock').value = '0';
+                    document.getElementById('initialStock').disabled = true;
+                    document.getElementById('reorderLevel').value = product.reorder_level;
+                    document.getElementById('supplier').value = product.supplier_id || '';
+                    
+                    // Show the modal
+                    const addProductModal = new bootstrap.Modal(document.getElementById('addProductModal'));
+                    addProductModal.show();
+                } else {
+                    alert('Error fetching product details: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('An error occurred while fetching product details.');
+            });
         }
         
         function deleteProduct(productId) {
             if (confirm('Are you sure you want to delete this product?')) {
-                // Implementation would send DELETE request to server
-                alert('Delete product ID: ' + productId);
+                // Send delete request via AJAX
+                const formData = new FormData();
+                formData.append('action', 'delete_product');
+                formData.append('productId', productId);
+                
+                fetch('inventory.php', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert(data.message);
+                        location.reload(); // Refresh the page
+                    } else {
+                        alert('Error: ' + data.message);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('An error occurred while deleting the product.');
+                });
             }
         }
         
         // Save stock adjustment
         document.getElementById('saveStockBtn').addEventListener('click', function() {
             const form = document.getElementById('adjustStockForm');
-            // Here you would validate and submit the form via AJAX
             
-            alert('Stock adjustment would be saved here.');
-            // Reset form and close modal
-            form.reset();
-            bootstrap.Modal.getInstance(document.getElementById('adjustStockModal')).hide();
+            // Validate form
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+            
+            // Send data via AJAX
+            const formData = new FormData(form);
+            formData.append('action', 'adjust_stock');
+            
+            fetch('inventory.php', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert(data.message);
+                    location.reload(); // Refresh the page
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('An error occurred while adjusting the stock.');
+            });
         });
         
-        // Save new product
+        // Save new product or update existing product
         document.getElementById('saveProductBtn').addEventListener('click', function() {
             const form = document.getElementById('addProductForm');
-            // Validate form and submit data via AJAX
-            alert('Product would be saved here.');
             
-            // Reset form and close modal after submission
-            // form.reset();
-            // bootstrap.Modal.getInstance(document.getElementById('addProductModal')).hide();
+            // Validate form
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+            
+            // Determine if this is an add or edit operation
+            const productId = document.getElementById('productId').value;
+            const action = productId ? 'edit_product' : 'add_product';
+            
+            // Send data via AJAX
+            const formData = new FormData(form);
+            formData.append('action', action);
+            
+            fetch('inventory.php', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert(data.message);
+                    location.reload(); // Refresh the page
+                } else {
+                    alert('Error: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('An error occurred while saving the product.');
+            });
+        });
+        
+        // Reset form and modal title when adding a new product
+        document.getElementById('addProductModal').addEventListener('hidden.bs.modal', function() {
+            document.getElementById('addProductForm').reset();
+            document.getElementById('productId').value = '';
+            document.getElementById('initialStock').disabled = false;
+            document.querySelector('#addProductModal .modal-title').textContent = 'Add New Product';
+        });
+        
+        // Export inventory data to CSV
+        document.getElementById('exportBtn').addEventListener('click', function() {
+            const table = document.querySelector('.table');
+            const headers = Array.from(table.querySelectorAll('th')).map(th => {
+                // Get the text content without the sort icon
+                const text = th.textContent.trim();
+                return text.replace(/[\n\r]+/g, ' ').trim();
+            });
+            
+            const rows = Array.from(table.querySelectorAll('tbody tr')).map(row => {
+                return Array.from(row.querySelectorAll('td')).map(cell => {
+                    return '"' + cell.textContent.trim().replace(/"/g, '""') + '"';
+                });
+            });
+            
+            // Create CSV content
+            let csvContent = headers.join(',') + '\n';
+            rows.forEach(row => {
+                csvContent += row.join(',') + '\n';
+            });
+            
+            // Create download link
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', 'inventory_export_<?= date('Ymd') ?>.csv');
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
         });
     </script>
 </body>

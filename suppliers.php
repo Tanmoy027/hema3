@@ -1,40 +1,170 @@
-
 <?php
-require 'db.php'; // This should initialize $conn from db.php
+require 'db.php'; // This file initializes $pdo and starts the session
 if (empty($_SESSION['uid'])) {
     header('Location: login.php');
     exit;
 }
 
-// Check if $conn is properly initialized
-if (!isset($conn) || $conn === null) {
-    // Create a fallback connection if not set by db.php
-    try {
-        $host = 'localhost';
-        $dbname = 'warehouse_db';
-        $user = 'root';
-        $pass = '';
-        $conn = new PDO("mysql:host=$host;dbname=$dbname;charset=utf8mb4", $user, $pass);
-        $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-    } catch(PDOException $e) {
-        die("Connection failed: " . $e->getMessage());
-    }
-}
+// Use $pdo from db.php for all database operations
+$conn = $pdo;
 
-// Process form submission for adding a new supplier
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'add_supplier') {
-    try {
-        $stmt = $conn->prepare("INSERT INTO suppliers (name, contact_name, phone, email, address) VALUES (?, ?, ?, ?, ?)");
-        $stmt->execute([
-            $_POST['name'],
-            $_POST['contact_name'],
-            $_POST['phone'],
-            $_POST['email'],
-            $_POST['address']
-        ]);
-        $successMessage = "Supplier added successfully!";
-    } catch(PDOException $e) {
-        $errorMessage = "Error: " . $e->getMessage();
+// Process AJAX requests
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // Add new supplier
+    if (isset($_POST['action']) && $_POST['action'] === 'add_supplier') {
+        try {
+            $stmt = $conn->prepare("INSERT INTO suppliers (name, contact_name, phone, email, address) VALUES (?, ?, ?, ?, ?)");
+            $stmt->execute([
+                $_POST['name'],
+                $_POST['contact_name'],
+                $_POST['phone'],
+                $_POST['email'],
+                $_POST['address']
+            ]);
+            $successMessage = "Supplier added successfully!";
+        } catch(PDOException $e) {
+            $errorMessage = "Error: " . $e->getMessage();
+        }
+    }
+    
+    // Process AJAX requests
+    if (isset($_POST['action'])) {
+        header('Content-Type: application/json');
+        $response = ['success' => false, 'message' => 'Invalid action'];
+        
+        // Edit supplier
+        if ($_POST['action'] === 'edit_supplier') {
+            try {
+                $stmt = $conn->prepare("UPDATE suppliers SET name = ?, contact_name = ?, phone = ?, email = ?, address = ? WHERE id = ?");
+                $stmt->execute([
+                    $_POST['name'],
+                    $_POST['contact_name'],
+                    $_POST['phone'],
+                    $_POST['email'],
+                    $_POST['address'],
+                    $_POST['supplierId']
+                ]);
+                
+                $response = ['success' => true, 'message' => 'Supplier updated successfully'];
+            } catch(PDOException $e) {
+                $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+            }
+        }
+        
+        // Delete supplier
+        else if ($_POST['action'] === 'delete_supplier') {
+            try {
+                // Check if supplier has associated products
+                $stmt = $conn->prepare("SELECT COUNT(*) FROM products WHERE supplier_id = ?");
+                $stmt->execute([$_POST['supplierId']]);
+                $productCount = $stmt->fetchColumn();
+                
+                if ($productCount > 0) {
+                    $response = ['success' => false, 'message' => 'Cannot delete supplier with associated products'];
+                } else {
+                    $stmt = $conn->prepare("DELETE FROM suppliers WHERE id = ?");
+                    $stmt->execute([$_POST['supplierId']]);
+                    $response = ['success' => true, 'message' => 'Supplier deleted successfully'];
+                }
+            } catch(PDOException $e) {
+                $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+            }
+        }
+        
+        // Get supplier details
+        else if ($_POST['action'] === 'get_supplier') {
+            try {
+                $stmt = $conn->prepare("SELECT * FROM suppliers WHERE id = ?");
+                $stmt->execute([$_POST['supplierId']]);
+                $supplier = $stmt->fetch(PDO::FETCH_ASSOC);
+                
+                if ($supplier) {
+                    $response = ['success' => true, 'supplier' => $supplier];
+                } else {
+                    $response = ['success' => false, 'message' => 'Supplier not found'];
+                }
+            } catch(PDOException $e) {
+                $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+            }
+        }
+        
+        // Get supplier products
+        else if ($_POST['action'] === 'get_supplier_products') {
+            try {
+                if (empty($_POST['supplierId'])) {
+                    $response = ['success' => false, 'message' => 'Supplier ID is required'];
+                } else {
+                    $stmt = $conn->prepare("SELECT p.id, p.sku, p.name, p.unit_price 
+                                           FROM products p 
+                                           WHERE p.supplier_id = ? 
+                                           ORDER BY p.name");
+                    $stmt->execute([$_POST['supplierId']]);
+                    $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
+                    
+                    if (count($products) > 0) {
+                        $response = ['success' => true, 'products' => $products, 'count' => count($products)];
+                    } else {
+                        $response = ['success' => false, 'message' => 'No products found for this supplier. Please add products first.'];
+                    }
+                }
+            } catch(PDOException $e) {
+                $response = ['success' => false, 'message' => 'Database error: ' . $e->getMessage()];
+            }
+        }
+        
+        // Create purchase order
+        else if ($_POST['action'] === 'create_purchase_order') {
+            try {
+                $conn->beginTransaction();
+                
+                // Insert purchase order
+                $stmt = $conn->prepare("INSERT INTO purchase_orders (supplier_id, order_date, status, total_amount, ordered_by) 
+                                      VALUES (?, ?, 'OPEN', ?, ?)");
+                $stmt->execute([
+                    $_POST['supplier_id'],
+                    $_POST['order_date'],
+                    $_POST['total_amount'],
+                    $_SESSION['uid']
+                ]);
+                
+                $poId = $conn->lastInsertId();
+                
+                // Insert purchase order items
+                $items = json_decode($_POST['items'], true);
+                foreach ($items as $item) {
+                    $stmt = $conn->prepare("INSERT INTO purchase_order_items (po_id, product_id, qty_ordered, unit_cost) 
+                                          VALUES (?, ?, ?, ?)");
+                    $stmt->execute([
+                        $poId,
+                        $item['product_id'],
+                        $item['quantity'],
+                        $item['unit_cost']
+                    ]);
+                }
+                
+                $conn->commit();
+                $response = ['success' => true, 'message' => 'Purchase order created successfully', 'po_id' => $poId];
+            } catch(PDOException $e) {
+                $conn->rollBack();
+                $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+            }
+        }
+        
+        // Check if supplier has products
+        else if ($_POST['action'] === 'check_supplier_products') {
+            try {
+                $stmt = $conn->prepare("SELECT COUNT(*) FROM products WHERE supplier_id = ?");
+                $stmt->execute([$_POST['supplier_id']]);
+                $productCount = $stmt->fetchColumn();
+                
+                $response = ['success' => true, 'hasProducts' => ($productCount > 0), 'count' => $productCount];
+            } catch(PDOException $e) {
+                $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
+            }
+        }
+        
+        echo json_encode($response);
+        exit;
     }
 }
 
@@ -42,9 +172,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 try {
     $stmt = $conn->query("SELECT s.*, 
                          (SELECT COUNT(*) FROM products WHERE supplier_id = s.id) as product_count,
-                         (SELECT SUM(p.unit_price * COALESCE(v.on_hand, 0)) 
+                         (SELECT COALESCE(SUM(p.unit_price * COALESCE(vs.on_hand, 0)), 0)
                           FROM products p 
-                          LEFT JOIN v_product_stock v ON p.id = v.id 
+                          LEFT JOIN v_product_stock vs ON p.id = vs.id
                           WHERE p.supplier_id = s.id) as inventory_value
                          FROM suppliers s
                          ORDER BY s.name");
@@ -113,7 +243,7 @@ try {
     <header>
         <div class="container">
             <h1 class="display-5 fw-bold mb-3">SUPPLIER MANAGEMENT</h1>
-            <p class="lead mb-0">Vendors: <?= count($suppliers) ?> | Last Order: <?= !empty($recentOrders) ? date('M d, Y', strtotime($recentOrders[0]['order_date'])) : 'N/A' ?></p>
+            <p class="lead mb-0">Vendors: <?= count($suppliers) ?> | Last Order: <?= !empty($recentOrders) ? date('M d, Y', strtotime($recentOrders[0]['order_date'])) : 'N/A' ?> | User: <?= htmlspecialchars($_SESSION['username'] ?? 'Tanmoy027') ?></p>
         </div>
     </header>
 
@@ -151,10 +281,10 @@ try {
                                 <i class="bi bi-cart-plus me-1"></i> NEW ORDER
                             </button>
                             <div class="btn-group d-inline-block">
-                                <button class="btn btn-outline-light" title="Export Data">
+                                <button class="btn btn-outline-light" title="Export Data" id="exportBtn">
                                     <i class="bi bi-file-earmark-arrow-down"></i>
                                 </button>
-                                <button class="btn btn-outline-light" title="Print">
+                                <button class="btn btn-outline-light" title="Print" onclick="window.print()">
                                     <i class="bi bi-printer"></i>
                                 </button>
                             </div>
@@ -187,7 +317,7 @@ try {
                         <tbody id="supplierTableBody">
                             <?php if (count($suppliers) > 0): ?>
                                 <?php foreach ($suppliers as $supplier): ?>
-                                    <tr>
+                                    <tr data-supplier-id="<?= $supplier['id'] ?>">
                                         <td class="fw-bold"><?= htmlspecialchars($supplier['name']) ?></td>
                                         <td>
                                             <?= htmlspecialchars($supplier['contact_name'] ?? 'N/A') ?>
@@ -206,10 +336,10 @@ try {
                                         </td>
                                         <td class="text-center">
                                             <div class="btn-group btn-group-sm">
-                                                <button class="btn btn-outline-light" title="View Products" onclick="viewProducts(<?= $supplier['id'] ?>)">
+                                                <a href="inventory.php?supplier=<?= $supplier['id'] ?>" class="btn btn-outline-light" title="View Products">
                                                     <i class="bi bi-box-seam"></i>
-                                                </button>
-                                                <button class="btn btn-outline-light" title="Create Order" onclick="createOrder(<?= $supplier['id'] ?>)">
+                                                </a>
+                                                <button class="btn btn-outline-light order-btn" title="Create Order" data-supplier-id="<?= $supplier['id'] ?>" data-product-count="<?= $supplier['product_count'] ?>">
                                                     <i class="bi bi-cart"></i>
                                                 </button>
                                                 <button class="btn btn-outline-light" title="Edit" onclick="editSupplier(<?= $supplier['id'] ?>)">
@@ -240,7 +370,6 @@ try {
                     </table>
                 </div>
             </div>
-            
             <div class="col-md-4">
                 <!-- Recent Orders Panel -->
                 <div class="card-glass">
@@ -289,31 +418,30 @@ try {
 
     <!-- Add Supplier Modal -->
     <div class="modal fade" id="addSupplierModal" tabindex="-1" aria-hidden="true">
-        <div class="modal-dialog modal-lg">
+        <div class="modal-dialog">
             <div class="modal-content card-glass text-white">
                 <div class="modal-header border-0">
                     <h5 class="modal-title">Add New Supplier</h5>
                     <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
                 <div class="modal-body">
-                    <form id="addSupplierForm" method="post" action="suppliers.php">
+                    <form id="addSupplierForm" method="POST">
                         <input type="hidden" name="action" value="add_supplier">
+                        <input type="hidden" id="supplierId" name="supplierId">
                         <div class="mb-3">
                             <label for="name" class="form-label">Company Name*</label>
                             <input type="text" class="form-control search-box" id="name" name="name" required>
                         </div>
-                        <div class="row mb-3">
-                            <div class="col-md-6">
-                                <label for="contact_name" class="form-label">Contact Person</label>
-                                <input type="text" class="form-control search-box" id="contact_name" name="contact_name">
-                            </div>
-                            <div class="col-md-6">
-                                <label for="phone" class="form-label">Phone Number</label>
-                                <input type="tel" class="form-control search-box" id="phone" name="phone">
-                            </div>
+                        <div class="mb-3">
+                            <label for="contact_name" class="form-label">Contact Person</label>
+                            <input type="text" class="form-control search-box" id="contact_name" name="contact_name">
                         </div>
                         <div class="mb-3">
-                            <label for="email" class="form-label">Email Address</label>
+                            <label for="phone" class="form-label">Phone Number</label>
+                            <input type="tel" class="form-control search-box" id="phone" name="phone">
+                        </div>
+                        <div class="mb-3">
+                            <label for="email" class="form-label">Email</label>
                             <input type="email" class="form-control search-box" id="email" name="email">
                         </div>
                         <div class="mb-3">
@@ -324,7 +452,7 @@ try {
                 </div>
                 <div class="modal-footer border-0">
                     <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">CANCEL</button>
-                    <button type="submit" form="addSupplierForm" class="btn btn-primary">SAVE SUPPLIER</button>
+                    <button type="button" id="saveSupplierBtn" class="btn btn-primary">SAVE SUPPLIER</button>
                 </div>
             </div>
         </div>
@@ -346,7 +474,7 @@ try {
                                 <select class="form-select search-box" id="po_supplier" name="supplier_id" required>
                                     <option value="" selected>-- Select Supplier --</option>
                                     <?php foreach ($suppliers as $supplier): ?>
-                                        <option value="<?= $supplier['id'] ?>">
+                                        <option value="<?= $supplier['id'] ?>" data-product-count="<?= $supplier['product_count'] ?>">
                                             <?= htmlspecialchars($supplier['name']) ?>
                                         </option>
                                     <?php endforeach; ?>
@@ -425,16 +553,82 @@ try {
         </div>
     </div>
 
+    <!-- No Products Modal -->
+    <div class="modal fade" id="noProductsModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content card-glass text-white">
+                <div class="modal-header border-0">
+                    <h5 class="modal-title">No Products Available</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body text-center">
+                    <i class="bi bi-exclamation-triangle text-warning" style="font-size: 3rem;"></i>
+                    <p class="my-3">No products found for this supplier.</p>
+                    <p>You need to add products before you can create purchase orders.</p>
+                </div>
+                <div class="modal-footer border-0">
+                    <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">CANCEL</button>
+                    <a href="#" id="addProductBtn" class="btn btn-primary">ADD PRODUCTS</a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Error Modal -->
+    <div class="modal fade" id="errorModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content card-glass text-white">
+                <div class="modal-header border-0">
+                    <h5 class="modal-title">Error</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body text-center">
+                    <i class="bi bi-exclamation-circle text-danger" style="font-size: 3rem;"></i>
+                    <p class="my-3" id="errorModalMessage">An error occurred.</p>
+                </div>
+                <div class="modal-footer border-0">
+                    <button type="button" class="btn btn-outline-light" data-bs-dismiss="modal">OK</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <footer class="mt-auto text-center py-3 small text-white-50" style="background:var(--dark)">
-        © <?=date('Y')?> Warehouse Management System
+        © <?=date('Y')?> Warehouse Management System | <?= date('Y-m-d H:i:s', strtotime('2025-05-17 03:17:06')) ?>
     </footer>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
+        // Initialize Bootstrap modals
+        var purchaseOrderModal = new bootstrap.Modal(document.getElementById('addPurchaseOrderModal'));
+        var noProductsModal = new bootstrap.Modal(document.getElementById('noProductsModal'));
+        var errorModal = new bootstrap.Modal(document.getElementById('errorModal'));
+
+        // Utility function to safely add event listeners with null/undefined check
+        function addSafeEventListener(element, event, handler) {
+            if (element) {
+                element.addEventListener(event, handler);
+            }
+        }
+        
+        // Show error in modal instead of alert
+        function showError(message) {
+            var errorMsg = document.getElementById('errorModalMessage');
+            if (errorMsg) {
+                errorMsg.textContent = message;
+                errorModal.show();
+            } else {
+                // Fallback to alert if modal not available
+                alert(message);
+            }
+        }
+        
         // Search functionality
-        document.getElementById('searchInput').addEventListener('keyup', function() {
+        addSafeEventListener(document.getElementById('searchInput'), 'keyup', function() {
             const searchValue = this.value.toLowerCase();
             const tableBody = document.getElementById('supplierTableBody');
+            if (!tableBody) return;
+            
             const rows = tableBody.getElementsByTagName('tr');
             
             for (let i = 0; i < rows.length; i++) {
@@ -457,106 +651,595 @@ try {
             }
         });
 
+        // Add click handler for order buttons - using event delegation to avoid null issues
+        document.addEventListener('click', function(event) {
+            // Handle order button clicks
+            if (event.target.closest('.order-btn')) {
+                const button = event.target.closest('.order-btn');
+                const supplierId = button.dataset.supplierId;
+                const productCount = parseInt(button.dataset.productCount) || 0;
+                
+                if (productCount === 0) {
+                    // Show no products modal
+                    const addProductBtn = document.getElementById('addProductBtn');
+                    if (addProductBtn) {
+                        addProductBtn.href = 'inventory.php?supplier=' + supplierId;
+                    }
+                    noProductsModal.show();
+                } else {
+                    // Show order modal and load products
+                    const poSupplierSelect = document.getElementById('po_supplier');
+                    if (poSupplierSelect) {
+                        poSupplierSelect.value = supplierId;
+                    }
+                    loadSupplierProducts(supplierId);
+                    purchaseOrderModal.show();
+                }
+            }
+        });
+
         // Supplier management functions
-        function viewProducts(supplierId) {
-            // Implementation would redirect to filtered inventory view
-            window.location.href = 'inventory.php?supplier=' + supplierId;
-        }
-        
-        function createOrder(supplierId) {
-            // Set the supplier in the PO form and open the modal
-            document.getElementById('po_supplier').value = supplierId;
-            const addPurchaseOrderModal = new bootstrap.Modal(document.getElementById('addPurchaseOrderModal'));
-            addPurchaseOrderModal.show();
-        }
-        
         function editSupplier(supplierId) {
-            // Implementation would populate and show the edit supplier modal
-            alert('Edit supplier ID: ' + supplierId);
+            // Reset form
+            var form = document.getElementById('addSupplierForm');
+            if (!form) return;
+            
+            form.reset();
+            
+            var supplierIdField = document.getElementById('supplierId');
+            if (supplierIdField) {
+                supplierIdField.value = supplierId;
+            }
+            
+            // Change modal title
+            var modalTitle = document.querySelector('#addSupplierModal .modal-title');
+            if (modalTitle) {
+                modalTitle.textContent = 'Edit Supplier';
+            }
+            
+            var actionField = form.querySelector('input[name="action"]');
+            if (actionField) {
+                actionField.value = 'edit_supplier';
+            }
+            
+            // Fetch supplier data via AJAX
+            const formData = new FormData();
+            formData.append('action', 'get_supplier');
+            formData.append('supplierId', supplierId);
+            
+            fetch('suppliers.php', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Network response was not ok: ' + response.status);
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.success) {
+                    // Populate form fields
+                    const supplier = data.supplier;
+                    document.getElementById('name').value = supplier.name || '';
+                    
+                    var contactNameField = document.getElementById('contact_name');
+                    if (contactNameField) contactNameField.value = supplier.contact_name || '';
+                    
+                    var phoneField = document.getElementById('phone');
+                    if (phoneField) phoneField.value = supplier.phone || '';
+                    
+                    var emailField = document.getElementById('email');
+                    if (emailField) emailField.value = supplier.email || '';
+                    
+                    var addressField = document.getElementById('address');
+                    if (addressField) addressField.value = supplier.address || '';
+                    
+                    // Show the modal
+                    var addSupplierModal = new bootstrap.Modal(document.getElementById('addSupplierModal'));
+                    addSupplierModal.show();
+                } else {
+                    showError('Error fetching supplier details: ' + (data.message || 'Unknown error'));
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showError('An error occurred while fetching supplier details: ' + error.message);
+            });
         }
         
         function deleteSupplier(supplierId) {
             if (confirm('Are you sure you want to delete this supplier?')) {
-                // Implementation would send DELETE request to server
-                alert('Delete supplier ID: ' + supplierId);
+                // Send delete request via AJAX
+                const formData = new FormData();
+                formData.append('action', 'delete_supplier');
+                formData.append('supplierId', supplierId);
+                
+                fetch('suppliers.php', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert(data.message);
+                        location.reload(); // Refresh the page
+                    } else {
+                        showError('Error: ' + data.message);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    showError('An error occurred while deleting the supplier: ' + error.message);
+                });
             }
         }
         
         // Purchase Order functionality
-        document.getElementById('addItemBtn').addEventListener('click', function() {
-            addOrderItem();
+        let itemCount = 0;
+        
+        // Add Item button - using safe event listener
+        addSafeEventListener(document.getElementById('addItemBtn'), 'click', function() {
+            const supplierSelect = document.getElementById('po_supplier');
+            if (!supplierSelect) return;
+            
+            const supplier_id = supplierSelect.value;
+            if (!supplier_id) {
+                showError('Please select a supplier first.');
+                return;
+            }
+            
+            // Add item row and load products
+            const newRow = addOrderItem();
+            if (newRow) {
+                loadProductsForRow(supplier_id, newRow);
+            }
         });
+
+        // Load supplier products when supplier is selected
+        addSafeEventListener(document.getElementById('po_supplier'), 'change', function() {
+            const supplierId = this.value;
+            if (supplierId) {
+                // Get product count from the option data
+                const option = this.options[this.selectedIndex];
+                if (!option) return;
+                
+                const productCount = parseInt(option.dataset.productCount) || 0;
+                
+                if (productCount === 0) {
+                    // Show warning modal
+                    const addProductBtn = document.getElementById('addProductBtn');
+                    if (addProductBtn) {
+                        addProductBtn.href = 'inventory.php?supplier=' + supplierId;
+                    }
+                    noProductsModal.show();
+                    
+                    // Reset select
+                    this.value = '';
+                } else {
+                    // Load products
+                    loadSupplierProducts(supplierId);
+                }
+            }
+        });
+        
+        function loadSupplierProducts(supplierId) {
+            if (!supplierId) return;
+            
+            // Clear existing items
+            const tbody = document.querySelector('#orderItemsTable tbody');
+            if (!tbody) return;
+            
+            const emptyRow = document.getElementById('emptyOrderRow');
+            
+            // Remove existing product rows
+            const existingRows = tbody.querySelectorAll('.order-item-row');
+            existingRows.forEach(row => {
+                row.parentNode.removeChild(row);
+            });
+            
+            // Show empty row
+            if (emptyRow) {
+                emptyRow.style.display = '';
+            }
+            
+            // Reset total
+            const orderTotal = document.getElementById('orderTotal');
+            if (orderTotal) {
+                orderTotal.textContent = '$0.00';
+            }
+            
+            // Reset item count
+            itemCount = 0;
+            
+            // Create form data
+            const formData = new FormData();
+            formData.append('action', 'get_supplier_products');
+            formData.append('supplierId', supplierId);
+            
+            fetch('suppliers.php', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Network response was not ok: ' + response.status);
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.success && data.products && data.products.length > 0) {
+                    // Add first item
+                    const newRow = addOrderItem();
+                    if (newRow) {
+                        const productSelect = newRow.querySelector('.product-select');
+                        if (productSelect) {
+                            populateProductDropdown(productSelect, data.products);
+                        }
+                    }
+                } else {
+                    // Show warning modal
+                    const addProductBtn = document.getElementById('addProductBtn');
+                    if (addProductBtn) {
+                        addProductBtn.href = 'inventory.php?supplier=' + supplierId;
+                    }
+                    noProductsModal.show();
+                    
+                    // Hide purchase order modal
+                    if (purchaseOrderModal) {
+                        purchaseOrderModal.hide();
+                    }
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showError('Error loading products: ' + error.message);
+            });
+        }
+        
+        function loadProductsForRow(supplierId, rowElement) {
+            if (!supplierId || !rowElement) return;
+            
+            const formData = new FormData();
+            formData.append('action', 'get_supplier_products');
+            formData.append('supplierId', supplierId);
+            
+            fetch('suppliers.php', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Network response was not ok: ' + response.status);
+                }
+                return response.json();
+            })
+            .then(data => {
+                if (data.success && data.products && data.products.length > 0) {
+                    const productSelect = rowElement.querySelector('.product-select');
+                    if (productSelect) {
+                        populateProductDropdown(productSelect, data.products);
+                    }
+                } else {
+                    // Show warning modal
+                    const addProductBtn = document.getElementById('addProductBtn');
+                    if (addProductBtn) {
+                        addProductBtn.href = 'inventory.php?supplier=' + supplierId;
+                    }
+                    noProductsModal.show();
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showError('Error loading products: ' + error.message);
+            });
+        }
+        
+        function populateProductDropdown(selectElement, products) {
+            if (!selectElement || !products) return;
+            
+            // Clear existing options except the first one
+            while (selectElement.options.length > 1) {
+                selectElement.remove(1);
+            }
+            
+            // Add product options
+            products.forEach(product => {
+                const option = document.createElement('option');
+                option.value = product.id;
+                option.textContent = `${product.sku} - ${product.name} ($${parseFloat(product.unit_price).toFixed(2)})`;
+                option.dataset.price = product.unit_price;
+                selectElement.appendChild(option);
+            });
+            
+            // Set up change event only once
+            if (!selectElement.dataset.eventSet) {
+                selectElement.addEventListener('change', function() {
+                    const selectedOption = this.options[this.selectedIndex];
+                    if (!selectedOption) return;
+                    
+                    const row = this.closest('.order-item-row');
+                    if (!row) return;
+                    
+                    if (selectedOption && selectedOption.dataset.price) {
+                        const costInput = row.querySelector('.item-cost');
+                        if (costInput) {
+                            costInput.value = selectedOption.dataset.price;
+                            updateItemTotal.call(costInput);
+                        }
+                    }
+                });
+                selectElement.dataset.eventSet = 'true';
+            }
+        }
         
         function addOrderItem() {
             const tbody = document.querySelector('#orderItemsTable tbody');
+            if (!tbody) return null;
+            
             const emptyRow = document.getElementById('emptyOrderRow');
-            const template = document.getElementById('itemTemplate').innerHTML;
+            const template = document.getElementById('itemTemplate');
+            if (!template) return null;
+            
+            const templateHTML = template.innerHTML;
+            if (!templateHTML) return null;
             
             // Hide the empty row message
             if (emptyRow) {
-                emptyRow.classList.add('d-none');
+                emptyRow.style.display = 'none';
             }
             
             // Create new row for the item
-            const index = document.querySelectorAll('.order-item-row').length;
-            const newRow = template.replace(/__INDEX__/g, index);
-            tbody.insertAdjacentHTML('beforeend', newRow);
+            const newRow = document.createElement('tr');
+            newRow.className = 'order-item-row';
+            newRow.innerHTML = templateHTML.replace(/__INDEX__/g, itemCount++);
+            tbody.appendChild(newRow);
             
-            // Add event listeners to the new row elements
-            const newRowElement = tbody.lastElementChild;
+            // Add event listeners
+            const qtyInput = newRow.querySelector('.item-qty');
+            if (qtyInput) {
+                qtyInput.addEventListener('input', updateItemTotal);
+            }
             
-            // Update totals when quantity or cost changes
-            const qtyInput = newRowElement.querySelector('.item-qty');
-            const costInput = newRowElement.querySelector('.item-cost');
+            const costInput = newRow.querySelector('.item-cost');
+            if (costInput) {
+                costInput.addEventListener('input', updateItemTotal);
+            }
             
-            qtyInput.addEventListener('change', updateItemTotal);
-            costInput.addEventListener('change', updateItemTotal);
+            const removeBtn = newRow.querySelector('.remove-item-btn');
+            if (removeBtn) {
+                removeBtn.addEventListener('click', function() {
+                    newRow.remove();
+                    updateOrderTotal();
+                    
+                    // Show empty row if no items left
+                    const itemRows = document.querySelectorAll('.order-item-row');
+                    if (itemRows.length === 0 && emptyRow) {
+                        emptyRow.style.display = '';
+                    }
+                });
+            }
             
-            // Remove item functionality
-            const removeBtn = newRowElement.querySelector('.remove-item-btn');
-            removeBtn.addEventListener('click', function() {
-                newRowElement.remove();
-                updateOrderTotal();
-                
-                // Show the empty message if no items left
-                if (document.querySelectorAll('.order-item-row').length === 0) {
-                    emptyRow.classList.remove('d-none');
-                }
-            });
+            return newRow;
         }
         
         function updateItemTotal() {
             const row = this.closest('.order-item-row');
-            const qty = parseFloat(row.querySelector('.item-qty').value) || 0;
-            const cost = parseFloat(row.querySelector('.item-cost').value) || 0;
+            if (!row) return;
+            
+            const qtyInput = row.querySelector('.item-qty');
+            const costInput = row.querySelector('.item-cost');
+            const totalCell = row.querySelector('.item-total');
+            if (!qtyInput || !costInput || !totalCell) return;
+            
+            const qty = parseFloat(qtyInput.value) || 0;
+            const cost = parseFloat(costInput.value) || 0;
             const total = qty * cost;
             
-            row.querySelector('.item-total').textContent = '$' + total.toFixed(2);
+            totalCell.textContent = '$' + total.toFixed(2);
             updateOrderTotal();
         }
         
         function updateOrderTotal() {
-            const itemTotals = document.querySelectorAll('.item-total');
-            let orderTotal = 0;
-            
-            itemTotals.forEach(item => {
-                const value = parseFloat(item.textContent.replace('$', '')) || 0;
-                orderTotal += value;
+            let total = 0;
+            document.querySelectorAll('.item-total').forEach(cell => {
+                const value = parseFloat(cell.textContent.replace('$', '')) || 0;
+                total += value;
             });
             
-            document.getElementById('orderTotal').textContent = '$' + orderTotal.toFixed(2);
+            const orderTotalEl = document.getElementById('orderTotal');
+            if (orderTotalEl) {
+                orderTotalEl.textContent = '$' + total.toFixed(2);
+            }
         }
         
-        document.getElementById('saveOrderBtn').addEventListener('click', function() {
+        // Save supplier
+        addSafeEventListener(document.getElementById('saveSupplierBtn'), 'click', function() {
+            const form = document.getElementById('addSupplierForm');
+            if (!form) return;
+            
+            // Validate form
+            if (!form.checkValidity()) {
+                form.reportValidity();
+                return;
+            }
+            
+            // Determine if this is an add or edit operation
+            const supplierId = document.getElementById('supplierId')?.value;
+            const isEdit = supplierId ? true : false;
+            
+            // If editing, send via AJAX
+            if (isEdit) {
+                const formData = new FormData(form);
+                
+                fetch('suppliers.php', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert(data.message);
+                        location.reload(); // Refresh the page
+                    } else {
+                        showError('Error: ' + data.message);
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    showError('An error occurred while saving the supplier: ' + error.message);
+                });
+            } else {
+                // For new supplier, submit the form
+                form.submit();
+            }
+        });
+        
+        // Create purchase order
+        addSafeEventListener(document.getElementById('saveOrderBtn'), 'click', function() {
             const form = document.getElementById('addPurchaseOrderForm');
+            if (!form) return;
             
-            // Here you would validate the form and submit it via AJAX
-            // For now, we'll just show an alert
-            alert('Purchase order would be saved here.');
+            // Validate supplier and date
+            const supplierSelect = document.getElementById('po_supplier');
+            const dateInput = document.getElementById('po_date');
+            if (!supplierSelect || !dateInput) return;
             
-            // Reset form and close modal
-            // form.reset();
-            // bootstrap.Modal.getInstance(document.getElementById('addPurchaseOrderModal')).hide();
+            const supplier = supplierSelect.value;
+            const orderDate = dateInput.value;
+            
+            if (!supplier || !orderDate) {
+                showError('Please select a supplier and order date.');
+                return;
+            }
+            
+            // Check if there are items
+            const items = document.querySelectorAll('.order-item-row');
+            if (items.length === 0) {
+                showError('Please add at least one item to the order.');
+                return;
+            }
+            
+            // Validate each item
+            let valid = true;
+            let orderItems = [];
+            
+            items.forEach((item, index) => {
+                const productSelect = item.querySelector('.product-select');
+                const qtyInput = item.querySelector('.item-qty');
+                const costInput = item.querySelector('.item-cost');
+                
+                if (!productSelect || !qtyInput || !costInput) {
+                    valid = false;
+                    return;
+                }
+                
+                const productId = productSelect.value;
+                const qty = qtyInput.value;
+                const cost = costInput.value;
+                
+                if (!productId || !qty || !cost) {
+                    valid = false;
+                    return;
+                }
+                
+                orderItems.push({
+                    product_id: productId,
+                    quantity: parseInt(qty),
+                    unit_cost: parseFloat(cost),
+                    total_cost: parseFloat(qty) * parseFloat(cost)
+                });
+            });
+            
+            if (!valid) {
+                showError('Please fill in all required fields for each item.');
+                return;
+            }
+            
+            // Get order total
+            const orderTotalEl = document.getElementById('orderTotal');
+            if (!orderTotalEl) return;
+            
+            const totalAmount = parseFloat(orderTotalEl.textContent.replace('$', '')) || 0;
+            
+            // Create and send form data
+            const formData = new FormData();
+            formData.append('action', 'create_purchase_order');
+            formData.append('supplier_id', supplier);
+            formData.append('order_date', orderDate);
+            formData.append('total_amount', totalAmount);
+            formData.append('items', JSON.stringify(orderItems));
+            
+            fetch('suppliers.php', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert(data.message);
+                    location.reload(); // Refresh the page
+                } else {
+                    showError('Error: ' + data.message);
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showError('An error occurred while creating the order: ' + error.message);
+            });
+        });
+        
+        // Reset form and modal title when adding a new supplier
+        const addSupplierModal = document.getElementById('addSupplierModal');
+        if (addSupplierModal) {
+            addSupplierModal.addEventListener('hidden.bs.modal', function() {
+                const form = document.getElementById('addSupplierForm');
+                if (form) form.reset();
+                
+                const supplierIdField = document.getElementById('supplierId');
+                if (supplierIdField) supplierIdField.value = '';
+                
+                const modalTitle = this.querySelector('.modal-title');
+                if (modalTitle) modalTitle.textContent = 'Add New Supplier';
+                
+                const actionField = form?.querySelector('input[name="action"]');
+                if (actionField) actionField.value = 'add_supplier';
+            });
+        }
+        
+        // Export supplier data to CSV
+        addSafeEventListener(document.getElementById('exportBtn'), 'click', function() {
+            const table = document.querySelector('.table');
+            if (!table) return;
+            
+            const headers = Array.from(table.querySelectorAll('th')).map(th => {
+                // Get the text content without the sort icon
+                const text = th.textContent.trim();
+                return text.replace(/[\n\r]+/g, ' ').trim();
+            });
+            
+            const rows = Array.from(table.querySelectorAll('tbody tr')).map(row => {
+                return Array.from(row.querySelectorAll('td')).map(cell => {
+                    return '"' + cell.textContent.trim().replace(/"/g, '""') + '"';
+                });
+            });
+            
+            // Create CSV content
+            let csvContent = headers.join(',') + '\n';
+            rows.forEach(row => {
+                csvContent += row.join(',') + '\n';
+            });
+            
+            // Create download link
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', 'suppliers_export_<?= date('Ymd') ?>.csv');
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
         });
     </script>
 </body>
