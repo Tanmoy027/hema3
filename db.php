@@ -1,4 +1,9 @@
 <?php
+// Only start the session if one hasn't been started already
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
 $host = 'localhost';
 $db   = 'warehouse_db';
 $user = 'root';
@@ -14,5 +19,4 @@ try {
 } catch (PDOException $e) {
     exit("DB connection failed: " . $e->getMessage());
 }
-session_start();
 ?>

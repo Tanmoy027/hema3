@@ -1,10 +1,131 @@
 <?php
+// Only start the session if one hasn't been started already
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
 require 'db.php';
+
+// Check if user is logged in
 if (empty($_SESSION['uid'])) {
     header('Location: login.php');
     exit;
 }
-// Pull additional user or warehouse data here if needed
+
+// Fetch the username from the database using the user ID stored in session
+$stmt = $pdo->prepare("SELECT username FROM users WHERE id = ?");
+$stmt->execute([$_SESSION['uid']]);
+$user = $stmt->fetch();
+$username = $user ? $user['username'] : 'Unknown User';
+
+// Store username in session for future use
+$_SESSION['username'] = $username;
+
+// Get current date in the required format for queries
+$today = date('Y-m-d');
+
+// Get real-time data for dashboard
+// 1. Get products below reorder level for alerts
+$lowStockQuery = $pdo->prepare("
+    SELECT p.*, v.on_hand 
+    FROM products p 
+    JOIN v_product_stock v ON p.id = v.id 
+    WHERE v.on_hand <= p.reorder_level 
+    ORDER BY (p.reorder_level - v.on_hand) DESC 
+    LIMIT 10
+");
+$lowStockQuery->execute();
+$lowStockProducts = $lowStockQuery->fetchAll();
+$lowStockCount = count($lowStockProducts);
+
+// 2. Get incoming purchase orders for today
+$incomingPoQuery = $pdo->prepare("
+    SELECT po.id, po.order_date, s.name as supplier_name 
+    FROM purchase_orders po
+    JOIN suppliers s ON po.supplier_id = s.id
+    WHERE po.status = 'OPEN' 
+    AND po.order_date <= ?
+    ORDER BY po.order_date ASC
+    LIMIT 10
+");
+$incomingPoQuery->execute([$today]);
+$incomingPurchaseOrders = $incomingPoQuery->fetchAll();
+$incomingCount = count($incomingPurchaseOrders);
+
+// 3. Get recent stock movements for alerts
+$recentMovementsQuery = $pdo->prepare("
+    SELECT sm.*, p.name as product_name, l.code as location_code, u.username
+    FROM stock_movements sm
+    JOIN products p ON sm.product_id = p.id
+    LEFT JOIN locations l ON sm.location_id = l.id
+    LEFT JOIN users u ON sm.moved_by = u.id
+    ORDER BY sm.moved_at DESC
+    LIMIT 5
+");
+$recentMovementsQuery->execute();
+$recentMovements = $recentMovementsQuery->fetchAll();
+
+// 4. Get safety alerts - simulate with location issues
+$locationIssuesQuery = $pdo->prepare("
+    SELECT l.*, COUNT(sm.id) as movement_count
+    FROM locations l
+    LEFT JOIN stock_movements sm ON l.id = sm.location_id
+    GROUP BY l.id
+    ORDER BY movement_count DESC
+    LIMIT 3
+");
+$locationIssuesQuery->execute();
+$locationIssues = $locationIssuesQuery->fetchAll();
+
+// 5. Get activities scheduled for today - simulated from stock movements and POs
+$scheduledActivities = [];
+
+// Morning inventory check - always present
+$scheduledActivities[] = [
+    'time' => '08:30',
+    'activity' => 'Morning inventory check',
+    'location' => 'ZONE B',
+    'type' => 'daily'
+];
+
+// Add incoming deliveries to schedule
+foreach($incomingPurchaseOrders as $index => $po) {
+    // Stagger delivery times 
+    $hour = 9 + $index;
+    $scheduledActivities[] = [
+        'time' => sprintf('%02d:00', $hour),
+        'activity' => "Supplier delivery ({$po['supplier_name']})",
+        'location' => 'DOCK ' . ($index + 1),
+        'type' => 'delivery',
+        'po_id' => $po['id']
+    ];
+    
+    // Only add 3 max to the schedule
+    if ($index >= 2) break;
+}
+
+// Add outbound shipment if we have stock movements
+if (!empty($recentMovements)) {
+    foreach($recentMovements as $index => $movement) {
+        if ($movement['movement_type'] == 'SALE' || $movement['qty'] < 0) {
+            $scheduledActivities[] = [
+                'time' => '14:30',
+                'activity' => 'Outbound shipment preparation',
+                'location' => $movement['location_code'] ? $movement['location_code'] : 'ZONE A',
+                'type' => 'outbound'
+            ];
+            break;
+        }
+    }
+}
+
+// Sort activities by time
+usort($scheduledActivities, function($a, $b) {
+    return strtotime($a['time']) - strtotime($b['time']);
+});
+
+// Limit to 3 activities
+$scheduledActivities = array_slice($scheduledActivities, 0, 3);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -51,7 +172,7 @@ if (empty($_SESSION['uid'])) {
     <header>
         <div class="container">
             <h1 class="display-5 fw-bold mb-3">OPERATIONS DASHBOARD</h1>
-            <p class="lead mb-0">Warehouse #<?= rand(100, 999) ?> | <?= date('Y-m-d') ?> | Zone B-East</p>
+            <p class="lead mb-0">Warehouse #WH-<?= sprintf('%03d', rand(100, 999)) ?> | <?= date('Y-m-d') ?> | User: <?= htmlspecialchars($username) ?></p>
         </div>
     </header>
 
@@ -66,7 +187,7 @@ if (empty($_SESSION['uid'])) {
                         <h4 class="fw-bold mb-2">INVENTORY</h4>
                         <p>Manage stock levels, products, and storage locations.</p>
                         <div class="mt-3">
-                            <span class="badge bg-warning">8 LOW STOCK</span>
+                            <span class="badge bg-warning"><?= $lowStockCount ?> LOW STOCK</span>
                         </div>
                     </div>
                 </a>
@@ -80,7 +201,7 @@ if (empty($_SESSION['uid'])) {
                         <h4 class="fw-bold mb-2">SUPPLIERS</h4>
                         <p>Track vendors, purchase orders, and shipments.</p>
                         <div class="mt-3">
-                            <span class="badge bg-success">3 INCOMING</span>
+                            <span class="badge bg-success"><?= $incomingCount ?> INCOMING</span>
                         </div>
                     </div>
                 </a>
@@ -109,18 +230,32 @@ if (empty($_SESSION['uid'])) {
                         ALERTS
                     </h5>
                     <ul class="list-group list-group-flush">
-                        <li class="d-flex justify-content-between align-items-center border-bottom py-2">
-                            <span>Shelf A23 requires inspection</span>
-                            <span class="badge bg-warning">SAFETY</span>
-                        </li>
-                        <li class="d-flex justify-content-between align-items-center border-bottom py-2">
-                            <span>8 products below reorder level</span>
-                            <span class="badge bg-danger">STOCK</span>
-                        </li>
-                        <li class="d-flex justify-content-between align-items-center py-2">
-                            <span>Shipment #4872 arriving today</span>
-                            <span class="badge bg-primary">LOGISTICS</span>
-                        </li>
+                        <?php if (!empty($locationIssues)): ?>
+                            <li class="d-flex justify-content-between align-items-center border-bottom py-2">
+                                <span>Shelf <?= htmlspecialchars($locationIssues[0]['code']) ?> requires inspection</span>
+                                <span class="badge bg-warning">SAFETY</span>
+                            </li>
+                        <?php endif; ?>
+                        
+                        <?php if ($lowStockCount > 0): ?>
+                            <li class="d-flex justify-content-between align-items-center border-bottom py-2">
+                                <span><?= $lowStockCount ?> products below reorder level</span>
+                                <span class="badge bg-danger">STOCK</span>
+                            </li>
+                        <?php endif; ?>
+                        
+                        <?php if ($incomingCount > 0): ?>
+                            <li class="d-flex justify-content-between align-items-center py-2">
+                                <span>Order #<?= $incomingPurchaseOrders[0]['id'] ?> arriving today</span>
+                                <span class="badge bg-primary">LOGISTICS</span>
+                            </li>
+                        <?php endif; ?>
+                        
+                        <?php if (empty($locationIssues) && $lowStockCount == 0 && $incomingCount == 0): ?>
+                            <li class="py-2">
+                                <span>No alerts at this time</span>
+                            </li>
+                        <?php endif; ?>
                     </ul>
                 </div>
             </div>
@@ -131,18 +266,18 @@ if (empty($_SESSION['uid'])) {
                         TODAY'S SCHEDULE
                     </h5>
                     <ul class="list-group list-group-flush">
-                        <li class="d-flex justify-content-between align-items-center border-bottom py-2">
-                            <span>08:30 - Morning inventory check</span>
-                            <span>ZONE B</span>
-                        </li>
-                        <li class="d-flex justify-content-between align-items-center border-bottom py-2">
-                            <span>10:00 - Supplier delivery (FastTruck)</span>
-                            <span>DOCK 3</span>
-                        </li>
-                        <li class="d-flex justify-content-between align-items-center py-2">
-                            <span>14:30 - Outbound shipment preparation</span>
-                            <span>ZONE A</span>
-                        </li>
+                        <?php foreach ($scheduledActivities as $index => $activity): ?>
+                            <li class="d-flex justify-content-between align-items-center <?= $index < count($scheduledActivities) - 1 ? 'border-bottom' : '' ?> py-2">
+                                <span><?= htmlspecialchars($activity['time']) ?> - <?= htmlspecialchars($activity['activity']) ?></span>
+                                <span><?= htmlspecialchars($activity['location']) ?></span>
+                            </li>
+                        <?php endforeach; ?>
+                        
+                        <?php if (empty($scheduledActivities)): ?>
+                            <li class="py-2">
+                                <span>No activities scheduled for today</span>
+                            </li>
+                        <?php endif; ?>
                     </ul>
                 </div>
             </div>
@@ -152,7 +287,7 @@ if (empty($_SESSION['uid'])) {
     <footer class="mt-auto text-center py-3 text-light">
         <div class="container d-flex justify-content-between align-items-center">
             <span>© <?=date('Y')?> WAREHOUSE MANAGEMENT SYSTEM</span>
-            <span>USER: <?= htmlspecialchars($_SESSION['username'] ?? 'zukalutoka') ?></span>
+            <span>USER: <?= htmlspecialchars($_SESSION['username']) ?></span>
         </div>
     </footer>
 

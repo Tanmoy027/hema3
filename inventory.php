@@ -1,9 +1,11 @@
 <?php
-require 'db.php'; // This file initializes $pdo and starts the session
+require 'db.php';
+
 if (empty($_SESSION['uid'])) {
     header('Location: login.php');
     exit;
-}
+
+}  
 
 // Use $pdo from db.php for all database operations
 $conn = $pdo;
@@ -18,13 +20,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
             $conn->beginTransaction();
             
-            // Insert into products table
-            $stmt = $conn->prepare("INSERT INTO products (sku, name, description, unit_price, reorder_level, supplier_id) 
-                                   VALUES (?, ?, ?, ?, ?, ?)");
+            // Handle image upload
+            $imagePath = null;
+            if (isset($_FILES['productImage']) && $_FILES['productImage']['error'] === UPLOAD_ERR_OK) {
+                $uploadDir = 'uploads/products/';
+                
+                // Create directory if it doesn't exist
+                if (!file_exists($uploadDir)) {
+                    mkdir($uploadDir, 0755, true);
+                }
+                
+                // Generate unique filename
+                $fileExtension = pathinfo($_FILES['productImage']['name'], PATHINFO_EXTENSION);
+                $uniqueFilename = uniqid('product_') . '.' . $fileExtension;
+                $targetFile = $uploadDir . $uniqueFilename;
+                
+                // Validate image file
+                $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+                $fileType = mime_content_type($_FILES['productImage']['tmp_name']);
+                
+                if (in_array($fileType, $allowedTypes) && $_FILES['productImage']['size'] < 5000000) { // 5MB limit
+                    if (move_uploaded_file($_FILES['productImage']['tmp_name'], $targetFile)) {
+                        $imagePath = $targetFile;
+                    }
+                }
+            }
+            
+            // Insert into products table with image path
+            $stmt = $conn->prepare("INSERT INTO products (sku, name, description, image_path, unit_price, reorder_level, supplier_id) 
+                                   VALUES (?, ?, ?, ?, ?, ?, ?)");
             $stmt->execute([
                 $_POST['sku'],
                 $_POST['name'],
                 $_POST['description'],
+                $imagePath,
                 $_POST['unitPrice'],
                 $_POST['reorderLevel'],
                 !empty($_POST['supplier']) ? $_POST['supplier'] : null
@@ -56,17 +85,69 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Update existing product
     if (isset($_POST['action']) && $_POST['action'] === 'edit_product') {
         try {
+            $productId = $_POST['productId'];
+            
+            // Handle image upload for update
+            $imagePath = null;
+            $keepExistingImage = isset($_POST['keepExistingImage']) && $_POST['keepExistingImage'] == '1';
+            
+            // First, get the current image path
+            $stmt = $conn->prepare("SELECT image_path FROM products WHERE id = ?");
+            $stmt->execute([$productId]);
+            $currentImagePath = $stmt->fetch(PDO::FETCH_COLUMN);
+            
+            if ($keepExistingImage) {
+                $imagePath = $currentImagePath; // Keep existing image
+            }
+            
+            // Handle new image upload
+            if (isset($_FILES['productImage']) && $_FILES['productImage']['error'] === UPLOAD_ERR_OK) {
+                $uploadDir = 'uploads/products/';
+                
+                // Create directory if it doesn't exist
+                if (!file_exists($uploadDir)) {
+                    mkdir($uploadDir, 0755, true);
+                }
+                
+                // Generate unique filename
+                $fileExtension = pathinfo($_FILES['productImage']['name'], PATHINFO_EXTENSION);
+                $uniqueFilename = uniqid('product_') . '.' . $fileExtension;
+                $targetFile = $uploadDir . $uniqueFilename;
+                
+                // Validate image file
+                $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+                $fileType = mime_content_type($_FILES['productImage']['tmp_name']);
+                
+                if (in_array($fileType, $allowedTypes) && $_FILES['productImage']['size'] < 5000000) { // 5MB limit
+                    if (move_uploaded_file($_FILES['productImage']['tmp_name'], $targetFile)) {
+                        // Delete old image if it exists and we're uploading a new one
+                        if (!empty($currentImagePath) && file_exists($currentImagePath)) {
+                            unlink($currentImagePath);
+                        }
+                        $imagePath = $targetFile;
+                    }
+                }
+            } elseif (!$keepExistingImage) {
+                // User wants to remove image without uploading a new one
+                if (!empty($currentImagePath) && file_exists($currentImagePath)) {
+                    unlink($currentImagePath);
+                }
+                $imagePath = null;
+            }
+            
+            // Update product in database with image path
             $stmt = $conn->prepare("UPDATE products SET sku = ?, name = ?, description = ?, 
-                                  unit_price = ?, reorder_level = ?, supplier_id = ? 
+                                  image_path = ?, unit_price = ?, reorder_level = ?, supplier_id = ? 
                                   WHERE id = ?");
             $stmt->execute([
                 $_POST['sku'],
                 $_POST['name'],
                 $_POST['description'],
+                $imagePath,
                 $_POST['unitPrice'],
                 $_POST['reorderLevel'],
                 !empty($_POST['supplier']) ? $_POST['supplier'] : null,
-                $_POST['productId']
+                $productId
             ]);
             
             $response = ['success' => true, 'message' => 'Product updated successfully'];
@@ -80,8 +161,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Delete product
     if (isset($_POST['action']) && $_POST['action'] === 'delete_product') {
         try {
+            // Get the image path first
+            $stmt = $conn->prepare("SELECT image_path FROM products WHERE id = ?");
+            $stmt->execute([$_POST['productId']]);
+            $imagePath = $stmt->fetch(PDO::FETCH_COLUMN);
+            
+            // Delete the product
             $stmt = $conn->prepare("DELETE FROM products WHERE id = ?");
             $stmt->execute([$_POST['productId']]);
+            
+            // Delete the image file if it exists
+            if (!empty($imagePath) && file_exists($imagePath)) {
+                unlink($imagePath);
+            }
+            
             $response = ['success' => true, 'message' => 'Product deleted successfully'];
         } catch (PDOException $e) {
             $response = ['success' => false, 'message' => 'Error: ' . $e->getMessage()];
@@ -165,8 +258,8 @@ try {
         $queryParams[] = $supplierFilter;
     }
     
-    // Using the existing view v_product_stock
-    $stmt = $conn->prepare("SELECT p.id, p.sku, p.name, p.description, p.unit_price, 
+    // Using the existing view v_product_stock - now including image_path
+    $stmt = $conn->prepare("SELECT p.id, p.sku, p.name, p.description, p.image_path, p.unit_price, 
                   COALESCE(vs.on_hand, 0) as stock,
                   p.reorder_level, s.name as supplier, s.id as supplier_id
                   FROM products p 
@@ -340,6 +433,7 @@ try {
             <table class="table table-custom table-hover mb-0">
                 <thead>
                     <tr>
+                        <th class="text-center" style="width: 80px;">IMAGE</th>
                         <th>
                             <div class="d-flex align-items-center">
                                 SKU
@@ -358,6 +452,15 @@ try {
                     <?php if (count($products) > 0): ?>
                         <?php foreach ($products as $product): ?>
                             <tr data-product-id="<?= $product['id'] ?>">
+                                <td class="text-center">
+                                    <?php if (!empty($product['image_path']) && file_exists($product['image_path'])): ?>
+                                        <img src="<?= htmlspecialchars($product['image_path']) ?>" alt="<?= htmlspecialchars($product['name']) ?>" class="img-thumbnail" style="max-height: 50px; max-width: 50px;">
+                                    <?php else: ?>
+                                        <div class="bg-secondary rounded d-flex align-items-center justify-content-center" style="width: 50px; height: 50px;">
+                                            <i class="bi bi-image text-light"></i>
+                                        </div>
+                                    <?php endif; ?>
+                                </td>
                                 <td class="fw-bold"><?= htmlspecialchars($product['sku']) ?></td>
                                 <td><?= htmlspecialchars($product['name']) ?></td>
                                 <td class="text-muted"><?= htmlspecialchars($product['description'] ?? '-') ?></td>
@@ -401,7 +504,7 @@ try {
                         <?php endforeach; ?>
                     <?php else: ?>
                         <tr>
-                            <td colspan="7" class="text-center py-4">
+                            <td colspan="8" class="text-center py-4">
                                 <div class="d-flex flex-column align-items-center">
                                     <i class="bi bi-inbox text-muted" style="font-size: 2.5rem;"></i>
                                     <h5 class="mt-2 mb-1">No products found</h5>
@@ -424,7 +527,7 @@ try {
                     <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
                 </div>
                 <div class="modal-body">
-                    <form id="addProductForm">
+                    <form id="addProductForm" enctype="multipart/form-data">
                         <input type="hidden" id="productId" name="productId">
                         <div class="row mb-3">
                             <div class="col-md-6">
@@ -439,6 +542,15 @@ try {
                         <div class="mb-3">
                             <label for="description" class="form-label">Description</label>
                             <textarea class="form-control search-box" id="description" name="description" rows="2"></textarea>
+                        </div>
+                        <div class="mb-3">
+                            <label for="productImage" class="form-label">Product Image</label>
+                            <input type="file" class="form-control search-box" id="productImage" name="productImage" accept="image/*">
+                            <div class="mt-2" id="imagePreviewContainer" style="display: none;">
+                                <img id="imagePreview" src="#" alt="Preview" class="img-thumbnail" style="max-height: 150px">
+                                <button type="button" class="btn btn-sm btn-outline-danger mt-1" id="removeImage">Remove</button>
+                            </div>
+                            <input type="hidden" id="keepExistingImage" name="keepExistingImage" value="1">
                         </div>
                         <div class="row mb-3">
                             <div class="col-md-4">
@@ -524,7 +636,7 @@ try {
     </div>
 
     <footer class="mt-auto text-center py-3 small text-white-50" style="background:var(--dark)">
-        © <?=date('Y')?> Warehouse Management System | Updated: 2025-05-17 01:03:41
+        © <?=date('Y')?> Warehouse Management System | Updated: 2025-05-23 17:17:02 | User: <?= htmlspecialchars($_SESSION['username'] ?? 'Tanmoy027') ?>
     </footer>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -555,6 +667,36 @@ try {
             }
         });
 
+        // Image preview functionality
+        document.getElementById('productImage').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            const imagePreviewContainer = document.getElementById('imagePreviewContainer');
+            const imagePreview = document.getElementById('imagePreview');
+            const keepExistingImage = document.getElementById('keepExistingImage');
+            
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    imagePreview.src = e.target.result;
+                    imagePreviewContainer.style.display = 'block';
+                    keepExistingImage.value = '0'; // New image will replace any existing one
+                }
+                reader.readAsDataURL(file);
+            } else {
+                imagePreviewContainer.style.display = 'none';
+            }
+        });
+
+        document.getElementById('removeImage').addEventListener('click', function() {
+            const imagePreviewContainer = document.getElementById('imagePreviewContainer');
+            const productImage = document.getElementById('productImage');
+            const keepExistingImage = document.getElementById('keepExistingImage');
+            
+            imagePreviewContainer.style.display = 'none';
+            productImage.value = ''; // Clear the file input
+            keepExistingImage.value = '0'; // Indicate we want to remove the image
+        });
+
         // Product functions
         function adjustStock(productId) {
             // Get the product details
@@ -562,7 +704,7 @@ try {
             if (!productRow) return;
             
             // Get product name and current stock from the row
-            const productName = productRow.cells[1].textContent;
+            const productName = productRow.cells[2].textContent; // Adjusted for new image column
             const currentStock = productRow.querySelector('.badge').textContent.trim();
             
             // Set values in the form
@@ -607,6 +749,20 @@ try {
                     document.getElementById('initialStock').disabled = true;
                     document.getElementById('reorderLevel').value = product.reorder_level;
                     document.getElementById('supplier').value = product.supplier_id || '';
+                    
+                    // Handle image preview
+                    const imagePreviewContainer = document.getElementById('imagePreviewContainer');
+                    const imagePreview = document.getElementById('imagePreview');
+                    const keepExistingImage = document.getElementById('keepExistingImage');
+                    
+                    if (product.image_path) {
+                        imagePreview.src = product.image_path;
+                        imagePreviewContainer.style.display = 'block';
+                        keepExistingImage.value = '1'; // Keep existing image by default
+                    } else {
+                        imagePreviewContainer.style.display = 'none';
+                        keepExistingImage.value = '0';
+                    }
                     
                     // Show the modal
                     const addProductModal = new bootstrap.Modal(document.getElementById('addProductModal'));
@@ -695,7 +851,7 @@ try {
             const productId = document.getElementById('productId').value;
             const action = productId ? 'edit_product' : 'add_product';
             
-            // Send data via AJAX
+            // Use FormData to handle file uploads
             const formData = new FormData(form);
             formData.append('action', action);
             
@@ -723,6 +879,8 @@ try {
             document.getElementById('addProductForm').reset();
             document.getElementById('productId').value = '';
             document.getElementById('initialStock').disabled = false;
+            document.getElementById('imagePreviewContainer').style.display = 'none';
+            document.getElementById('keepExistingImage').value = '1';
             document.querySelector('#addProductModal .modal-title').textContent = 'Add New Product';
         });
         
@@ -736,7 +894,9 @@ try {
             });
             
             const rows = Array.from(table.querySelectorAll('tbody tr')).map(row => {
-                return Array.from(row.querySelectorAll('td')).map(cell => {
+                return Array.from(row.querySelectorAll('td')).map((cell, index) => {
+                    // Skip the image column (first column) for the CSV
+                    if (index === 0) return ''; // Or return a placeholder like "Image URL"
                     return '"' + cell.textContent.trim().replace(/"/g, '""') + '"';
                 });
             });

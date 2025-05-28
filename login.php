@@ -1,15 +1,18 @@
-<?php require 'db.php';
+<?php 
+// Let db.php handle session start
+require 'db.php';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $username = trim($_POST['username'] ?? '');
     $passRaw  = $_POST['password'] ?? '';
 
-    $stmt = $pdo->prepare("SELECT id, password FROM users WHERE username = ?");
+    $stmt = $pdo->prepare("SELECT id, username, password FROM users WHERE username = ?");
     $stmt->execute([$username]);
     $user = $stmt->fetch();
 
     if ($user && password_verify($passRaw, $user['password'])) {
         $_SESSION['uid'] = $user['id'];
+        $_SESSION['username'] = $user['username']; // Store username in session
         header('Location: index.php');
         exit;
     }
